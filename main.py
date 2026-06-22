@@ -1,96 +1,80 @@
+import os
+import shutil
 import cv2
 import mss
 import numpy as np
-import pytesseract
 
+PASTA_PRINTS = "prints_roleta"
+PASTA_GABARITO = "gabarito"
 
-def criar_regiao(x1, y1, x2, y2):
-    return {
-        "top": min(y1, y2),
-        "left": min(x1, x2),
-        "width": abs(x2 - x1),
-        "height": abs(y2 - y1)
-    }
+def limpar_e_preparar_pasta():
+    if os.path.exists(PASTA_PRINTS):
+        shutil.rmtree(PASTA_PRINTS)
+    os.makedirs(PASTA_PRINTS)
 
+REGIAO = {"top": 120, "left": 1390, "width": 505, "height": 22}
 
-REGIAO = criar_regiao(1390, 120, 1895, 142)
+# Carrega as amostras coloridas na memória
+GABARITO = []
+if os.path.exists(PASTA_GABARITO):
+    for arquivo in os.listdir(PASTA_GABARITO):
+        if arquivo.endswith(".png"):
+            num_verdadeiro = arquivo.split("_")[0]
+            img_gab = cv2.imread(os.path.join(PASTA_GABARITO, arquivo))
+            GABARITO.append((num_verdadeiro, img_gab))
 
-NUM_SLOTS = 13
-
-
-def preprocess(slot):
-    gray = slot
-
-    # leve blur só para remover ruído de captura
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-
-    # binarização mais estável (invertido ajuda em números claros)
-    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # garante fundo branco / número preto consistente
-    if np.mean(th) < 127:
-        th = cv2.bitwise_not(th)
-
-    # MORPH para juntar falhas de pixel
-    kernel = np.ones((2, 2), np.uint8)
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel)
-
-    return th
-
-
-def extrair_numero(slot_img):
-    img = preprocess(slot_img)
-
-    config = (
-        "--psm 7 -c tessedit_char_whitelist=0123456789"
-    )
-
-    txt = pytesseract.image_to_string(img, config=config)
-    txt = ''.join(filter(str.isdigit, txt))
-
-    if txt == "":
+def reconhecer_por_gabarito(slot_miolo):
+    if not GABARITO:
         return ""
+        
+    melhor_numero = ""
+    maior_score = -1.0
+    
+    # Compara a imagem colorida atual com o gabarito colorido
+    for numero_verdadeiro, img_gab in GABARITO:
+        res = cv2.matchTemplate(slot_miolo, img_gab, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, _ = cv2.minMaxLoc(res)
+        
+        if max_val > maior_score:
+            maior_score = max_val
+            melhor_numero = numero_verdadeiro
+            
+    return melhor_numero if maior_score > 0.40 else ""
 
-    # segurança roleta
-    try:
-        val = int(txt)
-
-        if val > 36:
-            # evita erro tipo 710 virar 10 ou 0
-            txt = str(val % 100)
-
-        if val > 36:
-            return ""  # ainda inválido
-
-    except:
-        return ""
-
-    return txt
-
+# --- EXECUÇÃO ---
+limpar_e_preparar_pasta()
 
 with mss.MSS() as sct:
     screenshot = sct.grab(REGIAO)
 
 img = np.array(screenshot)
 img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+cv2.imwrite(os.path.join(PASTA_PRINTS, "captura_total.png"), img)
 
-gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-h, w = gray.shape
-slot_w = w // NUM_SLOTS
+h, w, _ = img.shape
+slot1_w = int(w * 0.095)
+resto_w = w - slot1_w
+outros_slots_w = resto_w // 12
 
 resultado = []
 
-for i in range(NUM_SLOTS):
-
-    x1 = i * slot_w
-    x2 = (i + 1) * slot_w if i < NUM_SLOTS - 1 else w
-
-    slot = gray[:, x1:x2]
-
-    numero = extrair_numero(slot)
-
+for i in range(13):
+    if i == 0:
+        x1, x2 = 0, slot1_w
+    else:
+        x1 = slot1_w + (i - 1) * outros_slots_w
+        x2 = slot1_w + i * outros_slots_w if i < 12 else w
+        
+    # Pega o mesmo miolo de 20x20 pixels
+    centro_x = x1 + ((x2 - x1) // 2)
+    centro_y = h // 2
+    slot_miolo = img[centro_y-10:centro_y+10, centro_x-10:centro_x+10]
+    
+    # Salva para você monitorar visualmente
+    cv2.imwrite(os.path.join(PASTA_PRINTS, f"slot_{i}_miolo.png"), slot_miolo)
+    
+    numero = reconhecer_por_gabarito(slot_miolo)
     resultado.append(numero)
 
-print("Resultado final:")
+print("Resultado final por Gabarito Colorido Estável:")
 print(resultado)

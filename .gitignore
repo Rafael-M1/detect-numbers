@@ -1,1 +1,11 @@
+# Templates
 templates/
+
+# Cache do Python
+__pycache__/
+**/__pycache__/
+
+# Arquivos compilados Python
+*.pyc
+*.pyo
+*.pyd

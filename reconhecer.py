@@ -87,15 +87,32 @@ def _tesseract_disponivel() -> bool:
 
 TESSERACT_OK = _tesseract_disponivel()
 
+def _crop_digito(bw: np.ndarray, pad: int = 3) -> np.ndarray:
+    """
+    Recorta apenas a bounding box dos pixels ativos.
+    Evita que espaço vazio ao redor seja interpretado como dígito extra pelo OCR.
+    """
+    ys, xs = np.where(bw > 0)
+    if len(xs) == 0:
+        return bw
+    x1 = max(0, xs.min() - pad)
+    x2 = min(bw.shape[1], xs.max() + pad)
+    y1 = max(0, ys.min() - pad)
+    y2 = min(bw.shape[0], ys.max() + pad)
+    return bw[y1:y2, x1:x2]
+
 def _ocr_bw(bw: np.ndarray) -> Optional[int]:
     """OCR em uma imagem binarizada. Retorna int ou None."""
     if not TESSERACT_OK:
         return None
     try:
         import pytesseract
-        h, w = bw.shape[:2]
+        # Recortar bounding box antes do OCR — evita espaço vazio
+        # ser interpretado como dígito extra (ex: "3" → "30")
+        bw_crop = _crop_digito(bw)
+        h, w = bw_crop.shape[:2]
         escala = max(4, 120 // max(h, 1))
-        ampliado = cv2.resize(bw, None, fx=escala, fy=escala,
+        ampliado = cv2.resize(bw_crop, None, fx=escala, fy=escala,
                               interpolation=cv2.INTER_CUBIC)
         margem = 10
         com_margem = cv2.copyMakeBorder(ampliado, margem, margem, margem, margem,
@@ -111,22 +128,26 @@ def _ocr_bw(bw: np.ndarray) -> Optional[int]:
 
 def ocr_regiao(bw: np.ndarray) -> Optional[int]:
     """
-    OCR com detecção de 'dígito estreito' para evitar confundir
-    números de 1 dígito estreito (1) com 2 dígitos (11).
+    OCR com protecao contra dois tipos de erro comuns:
 
-    Lógica:
-    - ratio < 0.9 → dígito estreito (provavelmente 1 ou 7) → OCR direto
-    - ratio >= 1.0 → dois dígitos → OCR direto (Tesseract lida bem com 2 dígitos
-      quando há pixels suficientes). Se retornar 1 dígito, retorna None
-      para forçar o fallback de Template Matching, que tem exemplos do 11.
+    1. Espaco vazio lido como digito extra (ex: "3" -> "30")
+       -> corrigido pelo crop automatico em _ocr_bw
+
+    2. Dois palitos estreitos lidos como 1 digito (ex: "11" -> "1")
+       -> detectado pelo ratio: se ratio >= 1.0 (dois digitos lado a lado)
+         mas OCR retornou numero de 1 digito < 10, descarta para
+         forcao o template matching.
+       -> EXCETO se o OCR retornou >= 10 (leu 2 digitos corretamente).
     """
     ratio, n_comp, comp_stats = calcular_ratio(bw)
     resultado = _ocr_bw(bw)
 
-    # Se ratio indica 2 dígitos mas OCR retornou apenas 1 dígito (< 10)
-    # → não confiar no OCR, deixar para template matching
-    if ratio >= 1.0 and resultado is not None and resultado < 10:
-        return None
+    # ratio >= 1.0 indica dois digitos lado a lado
+    if ratio >= 1.0:
+        if resultado is not None and resultado < 10:
+            # OCR leu so 1 digito numa regiao de 2 -> nao confiar
+            return None
+        # resultado >= 10 ou None -> aceitar normalmente
 
     return resultado
 

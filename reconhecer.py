@@ -1,349 +1,230 @@
 """
 Reconhecedor de Números de Roleta
 ==================================
-Lê uma imagem com 13 números em linha e retorna um array com os valores.
-Usa as imagens da pasta 'treino/' como base de templates.
+Lê uma imagem (22x505) com 13 números em linha e retorna um array com os valores.
+
+Como funciona:
+  1. Corta a imagem nas 13 casas (posições fixas: a 1ª é a caixa grande,
+     as demais têm ~38,33 px de espaçamento).
+  2. Em cada casa, estima a cor do fundo linha a linha pela margem esquerda
+     (onde nunca há dígito) e calcula o contraste de cada pixel contra esse
+     fundo — funciona com texto branco/vermelho/verde e fundo escuro, dourado
+     ou colorido.
+  3. Separa os dígitos individuais (componentes conectados; se dois dígitos
+     estiverem encostados, divide na coluna de menor tinta).
+  4. Classifica cada dígito (0–9) pelo vizinho mais próximo entre os dígitos
+     extraídos das imagens de treino. O rótulo vem do nome do arquivo.
 
 Uso:
     python reconhecer.py imagem.png
     python reconhecer.py imagem.png --debug
-    python reconhecer.py --indexar
+    python reconhecer.py pasta_com_imagens/
 """
 
-import cv2
-import numpy as np
+import argparse
 import os
 import sys
-import argparse
 from pathlib import Path
 from typing import Optional
 
+import cv2
+import numpy as np
+
 # ─── Configurações ────────────────────────────────────────────────────────────
 
-PASTA_TREINO    = "treino"
-PASTA_TEMPLATES = "templates"
-NUM_REGIOES     = 13
-VALIDOS         = set(range(0, 37))
+PASTA_TREINO = "treino"
+NUM_REGIOES  = 13
+LARGURA_IMG  = 505
+ALTURA_IMG   = 22
+PASSO_CASA   = 38.33     # distância entre centros das casas
+LIMIAR       = 90        # contraste mínimo para considerar pixel como dígito
+ALT_GLIFO    = 16        # tamanho normalizado do dígito
+LARG_GLIFO   = 14
+DIST_ALERTA  = 5.0       # distância acima disso → reconhecimento duvidoso
+                         # (no treino: mesmo dígito ≤ 5,8; dígitos diferentes ≥ 2,2)
+VALIDOS      = set(range(0, 37))
 
 # ─── Segmentação ──────────────────────────────────────────────────────────────
 
-def segmentar_regioes(img: np.ndarray, n: int = NUM_REGIOES) -> list:
-    h, w = img.shape[:2]
-    largura = w // n
-    regioes = []
-    for i in range(n):
-        x1 = i * largura
-        x2 = x1 + largura if i < n - 1 else w
-        regioes.append(img[:, x1:x2])
-    return regioes
+def _contraste(casa: np.ndarray, cols_fundo: slice, x_min: int, x_max: int) -> np.ndarray:
+    """Distância de cor de cada pixel ao fundo (estimado por linha)."""
+    fundo = np.median(casa[:, cols_fundo], axis=1, keepdims=True)
+    d = np.sqrt(((casa - fundo) ** 2).sum(axis=2))
+    d[:, :x_min] = 0
+    d[:, x_max:] = 0
+    return d
 
-# ─── Pré-processamento ────────────────────────────────────────────────────────
 
-def detectar_tipo_fundo(regiao_bgr: np.ndarray) -> str:
-    gray = cv2.cvtColor(regiao_bgr, cv2.COLOR_BGR2GRAY)
-    mediana = float(np.median(gray))
-    return "escuro" if mediana < 80 else "colorido"
+def mapas_das_casas(img: np.ndarray) -> list:
+    """Retorna, para cada uma das 13 casas, o mapa de contraste (float)."""
+    if img.shape[:2] != (ALTURA_IMG, LARGURA_IMG):
+        img = cv2.resize(img, (LARGURA_IMG, ALTURA_IMG), interpolation=cv2.INTER_AREA)
+    f = img.astype(np.float32)
 
-def binarizar(regiao_bgr: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(regiao_bgr, cv2.COLOR_BGR2GRAY)
-    mediana = float(np.median(gray))
+    # Casa 0: caixa grande (x 0..40), fonte maior
+    mapas = [_contraste(f[:, 0:40], slice(1, 5), 5, 38)]
 
-    if mediana < 30:
-        _, bw = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
-    else:
-        diff = np.abs(gray.astype(np.float32) - mediana)
-        bw = (diff > 50).astype(np.uint8) * 255
+    for i in range(1, NUM_REGIOES):
+        x1 = int(round(20 + i * PASSO_CASA - 19))
+        mapas.append(_contraste(f[:, x1:x1 + 38], slice(4, 10), 8, 36))
+    return mapas
 
-    kernel = np.ones((2, 2), np.uint8)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel)
-    return bw
 
-# ─── Análise de componentes ───────────────────────────────────────────────────
+def _dividir(d: np.ndarray, a: int, b: int) -> list:
+    """Divide um bloco com dois dígitos encostados na coluna de menor tinta."""
+    tinta = (d[:, a:b] > LIMIAR).sum(axis=0)
+    meio = (b - a) // 2
+    lo, hi = max(3, meio - 5), min(b - a - 3, meio + 6)
+    k = lo + int(np.argmin(tinta[lo:hi]))
+    return [(a, a + k), (a + k, b)]
 
-def calcular_ratio(bw: np.ndarray):
-    """Retorna (ratio largura/altura, n_componentes, stats)."""
-    _, labels, stats, _ = cv2.connectedComponentsWithStats(bw, connectivity=8)
-    n_comp = int(labels.max())
-    if n_comp == 0:
-        return 0.0, 0, []
 
-    comp_stats = [stats[j] for j in range(1, n_comp + 1)]
-    xs  = [s[0] for s in comp_stats]
-    x2s = [s[0] + s[2] for s in comp_stats]
-    total_w = max(x2s) - min(xs)
-    max_h   = max(s[3] for s in comp_stats)
-    ratio   = total_w / max_h if max_h > 0 else 0.0
-    return ratio, n_comp, comp_stats
+def separar_digitos(d: np.ndarray) -> list:
+    """Recorta cada dígito da casa. Retorna lista de mapas (esquerda → direita)."""
+    m = (d > LIMIAR).astype(np.uint8)
+    n, _, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    validos = [i for i in range(1, n) if st[i, 3] >= 8]   # ignora ruído baixo
+    blocos = sorted((st[i, 0], st[i, 0] + st[i, 2]) for i in validos)
 
-# ─── OCR via Tesseract ────────────────────────────────────────────────────────
+    unidos = []
+    for a, b in blocos:
+        if unidos and a < unidos[-1][1]:
+            unidos[-1] = (unidos[-1][0], max(b, unidos[-1][1]))
+        else:
+            unidos.append((a, b))
 
-def _tesseract_disponivel() -> bool:
+    altura = max((st[i, 3] for i in validos), default=14)
+    faixas = []
+    for a, b in unidos:
+        if len(unidos) == 1 and (b - a) > altura * 0.95:
+            faixas += _dividir(d, a, b)
+        else:
+            faixas.append((a, b))
+
+    digitos = []
+    for a, b in faixas:
+        sub = d[:, a:b]
+        ys = np.where((sub > LIMIAR).any(axis=1))[0]
+        if len(ys):
+            digitos.append(sub[ys[0]:ys[-1] + 1])
+    return digitos
+
+
+def vetorizar(g: np.ndarray) -> np.ndarray:
+    """Normaliza o dígito para altura fixa (mantendo proporção) e achata."""
+    g = np.clip(g / 255.0, 0, 1).astype(np.float32)
+    h, w = g.shape
+    nw = max(1, min(LARG_GLIFO, int(round(w * ALT_GLIFO / h))))
+    r = cv2.resize(g, (nw, ALT_GLIFO), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((ALT_GLIFO, LARG_GLIFO), np.float32)
+    off = (LARG_GLIFO - nw) // 2
+    canvas[:, off:off + nw] = r
+    return np.concatenate([canvas.ravel(), [w / h * 2]])
+
+# ─── Modelo (dígitos de treino) ───────────────────────────────────────────────
+
+def rotulo_do_nome(caminho: Path) -> Optional[list]:
     try:
-        import pytesseract
-        pytesseract.get_tesseract_version()
-        return True
-    except Exception:
-        return False
-
-TESSERACT_OK = _tesseract_disponivel()
-
-def _crop_digito(bw: np.ndarray, pad: int = 3) -> np.ndarray:
-    """
-    Recorta apenas a bounding box dos pixels ativos.
-    Evita que espaço vazio ao redor seja interpretado como dígito extra pelo OCR.
-    """
-    ys, xs = np.where(bw > 0)
-    if len(xs) == 0:
-        return bw
-    x1 = max(0, xs.min() - pad)
-    x2 = min(bw.shape[1], xs.max() + pad)
-    y1 = max(0, ys.min() - pad)
-    y2 = min(bw.shape[0], ys.max() + pad)
-    return bw[y1:y2, x1:x2]
-
-def _ocr_bw(bw: np.ndarray) -> Optional[int]:
-    """OCR em uma imagem binarizada. Retorna int ou None."""
-    if not TESSERACT_OK:
+        nums = [int(p) for p in caminho.stem.split("-")]
+    except ValueError:
         return None
-    try:
-        import pytesseract
-        # Recortar bounding box antes do OCR — evita espaço vazio
-        # ser interpretado como dígito extra (ex: "3" → "30")
-        bw_crop = _crop_digito(bw)
-        h, w = bw_crop.shape[:2]
-        escala = max(4, 120 // max(h, 1))
-        ampliado = cv2.resize(bw_crop, None, fx=escala, fy=escala,
-                              interpolation=cv2.INTER_CUBIC)
-        margem = 10
-        com_margem = cv2.copyMakeBorder(ampliado, margem, margem, margem, margem,
-                                        cv2.BORDER_CONSTANT, value=0)
-        config = "--psm 8 --oem 3 -c tessedit_char_whitelist=0123456789"
-        texto = pytesseract.image_to_string(com_margem, config=config).strip()
-        num = int(texto)
-        if num in VALIDOS:
-            return num
-    except Exception:
-        pass
-    return None
+    if len(nums) != NUM_REGIOES or any(n not in VALIDOS for n in nums):
+        return None
+    return nums
 
-def ocr_regiao(bw: np.ndarray) -> Optional[int]:
-    """
-    OCR com protecao contra dois tipos de erro comuns:
 
-    1. Espaco vazio lido como digito extra (ex: "3" -> "30")
-       -> corrigido pelo crop automatico em _ocr_bw
+def extrair_amostras(img: np.ndarray, numeros: list):
+    """Extrai (vetores, dígitos) de uma imagem rotulada. Casas inconsistentes são puladas."""
+    X, Y, puladas = [], [], 0
+    for d, n in zip(mapas_das_casas(img), numeros):
+        gs = separar_digitos(d)
+        if len(gs) != len(str(n)):
+            puladas += 1
+            continue
+        for g, ch in zip(gs, str(n)):
+            X.append(vetorizar(g))
+            Y.append(int(ch))
+    return X, Y, puladas
 
-    2. Dois palitos estreitos lidos como 1 digito (ex: "11" -> "1")
-       -> detectado pelo ratio: se ratio >= 1.0 (dois digitos lado a lado)
-         mas OCR retornou numero de 1 digito < 10, descarta para
-         forcao o template matching.
-       -> EXCETO se o OCR retornou >= 10 (leu 2 digitos corretamente).
-    """
-    ratio, n_comp, comp_stats = calcular_ratio(bw)
-    resultado = _ocr_bw(bw)
 
-    # ratio >= 1.0 indica dois digitos lado a lado
-    if ratio >= 1.0:
-        if resultado is not None and resultado < 10:
-            # OCR leu so 1 digito numa regiao de 2 -> nao confiar
-            return None
-        # resultado >= 10 ou None -> aceitar normalmente
+class Modelo:
+    def __init__(self, X, Y):
+        self.X = np.asarray(X, np.float32)
+        self.Y = np.asarray(Y, np.int32)
 
-    return resultado
-
-# ─── Template Matching ────────────────────────────────────────────────────────
-
-class BancoTemplates:
-    def __init__(self, pasta: str = PASTA_TEMPLATES):
-        self.pasta = Path(pasta)
-        self.banco: dict = {}
-        self._carregar()
-
-    def _carregar(self):
-        if not self.pasta.exists():
-            return
-        for dir_tipo in self.pasta.iterdir():
-            if not dir_tipo.is_dir():
+    @classmethod
+    def do_treino(cls, pasta: str = PASTA_TREINO, ignorar: Optional[str] = None,
+                  verbose: bool = False) -> "Modelo":
+        X, Y = [], []
+        for caminho in sorted(Path(pasta).glob("*.png")):
+            if ignorar and caminho.name == ignorar:
                 continue
-            tipo = dir_tipo.name
-            self.banco[tipo] = {}
-            for dir_num in dir_tipo.iterdir():
-                if not dir_num.is_dir():
-                    continue
-                try:
-                    num = int(dir_num.name)
-                except ValueError:
-                    continue
-                imgs = []
-                for arq in dir_num.glob("*.png"):
-                    img = cv2.imread(str(arq), cv2.IMREAD_GRAYSCALE)
-                    if img is not None:
-                        imgs.append(img)
-                if imgs:
-                    self.banco[tipo][num] = imgs
+            nums = rotulo_do_nome(caminho)
+            img = cv2.imread(str(caminho))
+            if nums is None or img is None:
+                if verbose:
+                    print(f"  [ignorado] {caminho.name}")
+                continue
+            x, y, puladas = extrair_amostras(img, nums)
+            if puladas and verbose:
+                print(f"  [aviso] {caminho.name}: {puladas} casa(s) não segmentadas")
+            X += x
+            Y += y
+        return cls(X, Y)
 
     def vazio(self) -> bool:
-        return len(self.banco) == 0
+        return len(self.Y) == 0
 
-    def reconhecer(self, bw: np.ndarray, tipo_fundo: str) -> Optional[int]:
-        candidatos = {}
-        if tipo_fundo in self.banco:
-            candidatos.update(self.banco[tipo_fundo])
-        if not candidatos:
-            for tipo in self.banco:
-                candidatos.update(self.banco[tipo])
-        if not candidatos:
-            return None
+    def classificar(self, g: np.ndarray):
+        dist = ((self.X - vetorizar(g)) ** 2).sum(axis=1)
+        k = int(np.argmin(dist))
+        return int(self.Y[k]), float(np.sqrt(dist[k]))
 
-        melhor_num   = None
-        melhor_score = float("inf")
-        h_ref, w_ref = bw.shape[:2]
+# ─── Reconhecimento ───────────────────────────────────────────────────────────
 
-        for num, lista_imgs in candidatos.items():
-            for tmpl in lista_imgs:
-                tmpl_r = cv2.resize(tmpl, (w_ref, h_ref), interpolation=cv2.INTER_AREA)
-                diff   = cv2.absdiff(bw.astype(np.float32), tmpl_r.astype(np.float32))
-                mse    = float(np.mean(diff ** 2))
-                if mse < melhor_score:
-                    melhor_score = mse
-                    melhor_num   = num
-
-        return melhor_num
-
-# ─── Indexação dos templates de treino ───────────────────────────────────────
-
-def indexar_treino(pasta_treino: str = PASTA_TREINO,
-                   pasta_templates: str = PASTA_TEMPLATES):
-    pasta = Path(pasta_treino)
-    if not pasta.exists():
-        print(f"[ERRO] Pasta '{pasta_treino}' não encontrada.")
-        return
-
-    imagens = list(pasta.glob("*.png")) + list(pasta.glob("*.jpg"))
-    if not imagens:
-        print(f"[AVISO] Nenhuma imagem encontrada em '{pasta_treino}'.")
-        return
-
-    print(f"Indexando {len(imagens)} imagem(ns) de treino…")
-    contadores: dict = {}
-
-    for caminho in imagens:
-        stem   = caminho.stem
-        partes = stem.split("-")
-        try:
-            numeros = [int(p) for p in partes]
-        except ValueError:
-            print(f"  [ignorado] nome inválido: {caminho.name}")
+def reconhecer_img(img: np.ndarray, modelo: Modelo, detalhes: bool = False):
+    """
+    Retorna a lista com os 13 números (-1 = falha).
+    Com detalhes=True retorna também a lista de distâncias (confiança) por casa.
+    """
+    numeros, dists = [], []
+    for d in mapas_das_casas(img):
+        gs = separar_digitos(d)
+        if not 1 <= len(gs) <= 2:
+            numeros.append(-1)
+            dists.append(float("inf"))
             continue
+        txt, pior = "", 0.0
+        for g in gs:
+            dig, dist = modelo.classificar(g)
+            txt += str(dig)
+            pior = max(pior, dist)
+        n = int(txt)
+        numeros.append(n if n in VALIDOS else -1)
+        dists.append(pior)
+    return (numeros, dists) if detalhes else numeros
 
-        if len(numeros) != NUM_REGIOES:
-            print(f"  [ignorado] {caminho.name} → {len(numeros)} números (esperado {NUM_REGIOES})")
-            continue
 
-        img = cv2.imread(str(caminho))
-        if img is None:
-            print(f"  [ignorado] não foi possível ler: {caminho.name}")
-            continue
-
-        regioes = segmentar_regioes(img)
-
-        for regiao, num in zip(regioes, numeros):
-            if num not in VALIDOS:
-                continue
-            tipo = detectar_tipo_fundo(regiao)
-            bw   = binarizar(regiao)
-
-            dest = Path(pasta_templates) / tipo / str(num)
-            dest.mkdir(parents=True, exist_ok=True)
-
-            contadores.setdefault(tipo, {}).setdefault(num, 0)
-            contadores[tipo][num] += 1
-            idx = contadores[tipo][num]
-
-            cv2.imwrite(str(dest / f"img_{idx:04d}.png"), bw)
-
-    total = sum(v for c in contadores.values() for v in c.values())
-    print(f"Indexação concluída: {total} templates salvos em '{pasta_templates}/'")
-    for tipo, nums in sorted(contadores.items()):
-        print(f"  Tipo '{tipo}': {sum(nums.values())} templates — números: {sorted(nums.keys())}")
-
-# ─── Reconhecimento principal ─────────────────────────────────────────────────
-
-def reconhecer_imagem(caminho: str,
-                      banco: BancoTemplates,
-                      debug: bool = False) -> list:
+def reconhecer_imagem(caminho: str, modelo: Modelo, debug: bool = False) -> list:
     img = cv2.imread(caminho)
     if img is None:
         raise FileNotFoundError(f"Imagem não encontrada: {caminho}")
-
-    regioes   = segmentar_regioes(img)
-    resultado = []
-
-    for i, regiao in enumerate(regioes):
-        tipo = detectar_tipo_fundo(regiao)
-        bw   = binarizar(regiao)
-
-        num    = ocr_regiao(bw)
-        metodo = "OCR"
-
-        if num is None:
-            num    = banco.reconhecer(bw, tipo)
-            metodo = "Template"
-
-        if num is None:
-            num    = -1
-            metodo = "FALHA"
-
-        resultado.append(num)
-
-        if debug:
-            ratio, n_comp, _ = calcular_ratio(bw)
-            print(f"  Região {i+1:2d} | fundo={tipo:8s} | ratio={ratio:.2f} | "
-                  f"comp={n_comp} | num={str(num):3s} | via {metodo}")
-
+    numeros, dists = reconhecer_img(img, modelo, detalhes=True)
     if debug:
-        _salvar_debug(img, resultado, "debug_resultado.png")
-        print("  → debug_resultado.png salvo")
-
-    return resultado
-
-def _salvar_debug(img: np.ndarray, numeros: list, saida: str):
-    escala = 6
-    out    = cv2.resize(img, None, fx=escala, fy=escala, interpolation=cv2.INTER_NEAREST)
-    h, w   = img.shape[:2]
-    larg   = w // NUM_REGIOES
-
-    for i, num in enumerate(numeros):
-        x1      = i * larg * escala
-        x2      = (x1 + larg * escala) if i < NUM_REGIOES - 1 else out.shape[1]
-        cor_box = (0, 255, 0) if num != -1 else (0, 0, 255)
-        cv2.rectangle(out, (x1, 0), (x2 - 1, out.shape[0] - 1), cor_box, 1)
-        cv2.putText(out, str(num), (x1 + 2, out.shape[0] - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-    cv2.imwrite(saida, out)
+        for i, (n, dist) in enumerate(zip(numeros, dists)):
+            alerta = "  <-- DUVIDOSO" if n == -1 or dist > DIST_ALERTA else ""
+            print(f"  Casa {i + 1:2d}: {n:3d}   dist={dist:6.2f}{alerta}")
+    return numeros
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Reconhecedor de números de roleta em imagens."
-    )
-    parser.add_argument("imagem", nargs="?",
-                        help="Caminho da imagem a reconhecer")
-    parser.add_argument("--indexar", action="store_true",
-                        help="Reindexar templates a partir da pasta de treino")
-    parser.add_argument("--debug", action="store_true",
-                        help="Mostrar detalhes e salvar imagem anotada")
+    parser = argparse.ArgumentParser(description="Reconhecedor de números de roleta em imagens.")
+    parser.add_argument("imagem", nargs="?", help="Imagem (ou pasta de imagens) a reconhecer")
+    parser.add_argument("--debug", action="store_true", help="Mostrar confiança por casa")
     parser.add_argument("--treino", default=PASTA_TREINO,
                         help=f"Pasta de treino (padrão: {PASTA_TREINO})")
-    parser.add_argument("--templates", default=PASTA_TEMPLATES,
-                        help=f"Pasta de templates (padrão: {PASTA_TEMPLATES})")
     args = parser.parse_args()
-
-    if args.indexar:
-        indexar_treino(args.treino, args.templates)
-        return
 
     if not args.imagem:
         parser.print_help()
@@ -353,20 +234,17 @@ def main():
         print(f"[ERRO] Arquivo não encontrado: {args.imagem}")
         sys.exit(1)
 
-    if not TESSERACT_OK:
-        print("[AVISO] Tesseract não encontrado — usando apenas Template Matching.")
+    modelo = Modelo.do_treino(args.treino)
+    if modelo.vazio():
+        print(f"[ERRO] Nenhum dígito de treino em '{args.treino}/'.")
+        sys.exit(1)
 
-    banco = BancoTemplates(args.templates)
-    if banco.vazio():
-        print("[AVISO] Banco de templates vazio. Execute primeiro:")
-        print("        python reconhecer.py --indexar")
-
-    if args.debug:
-        print(f"Processando: {args.imagem}")
-
-    numeros = reconhecer_imagem(args.imagem, banco, debug=args.debug)
-    print(numeros)
-    return numeros
+    alvo = Path(args.imagem)
+    arquivos = sorted(alvo.glob("*.png")) if alvo.is_dir() else [alvo]
+    for arq in arquivos:
+        if args.debug or len(arquivos) > 1:
+            print(f"{arq.name}:")
+        print(reconhecer_imagem(str(arq), modelo, debug=args.debug))
 
 
 if __name__ == "__main__":

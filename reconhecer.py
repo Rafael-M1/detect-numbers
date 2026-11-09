@@ -40,8 +40,8 @@ PASSO_CASA   = 38.33     # distância entre centros das casas
 LIMIAR       = 90        # contraste mínimo para considerar pixel como dígito
 ALT_GLIFO    = 16        # tamanho normalizado do dígito
 LARG_GLIFO   = 14
-DIST_ALERTA  = 5.0       # distância acima disso → reconhecimento duvidoso
-                         # (no treino: mesmo dígito ≤ 5,8; dígitos diferentes ≥ 2,2)
+DIST_ALERTA  = 3.5       # distância acima disso → reconhecimento duvidoso
+                         # (no treino: acertos ficam todos ≤ 2,8)
 VALIDOS      = set(range(0, 37))
 
 # ─── Segmentação ──────────────────────────────────────────────────────────────
@@ -93,11 +93,23 @@ def separar_digitos(d: np.ndarray) -> list:
         else:
             unidos.append((a, b))
 
+    tinta = m.sum(axis=0)
+
+    def aparar(a, b):
+        # Remove colunas das pontas com quase nenhuma tinta
+        # (ex.: linha fina horizontal grudada no dígito)
+        while b - a > 2 and tinta[a] <= 2:
+            a += 1
+        while b - a > 2 and tinta[b - 1] <= 2:
+            b -= 1
+        return a, b
+
+    unidos = [aparar(a, b) for a, b in unidos]
     altura = max((st[i, 3] for i in validos), default=14)
     faixas = []
     for a, b in unidos:
         if len(unidos) == 1 and (b - a) > altura * 0.95:
-            faixas += _dividir(d, a, b)
+            faixas += [aparar(x, y) for x, y in _dividir(d, a, b)]
         else:
             faixas.append((a, b))
 
